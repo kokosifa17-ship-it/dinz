@@ -6,7 +6,13 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const app = express();
 const port = process.env.PORT || 3000;
 const dataFile = path.join(__dirname, 'data.json');
-const sessionDir = path.join(__dirname, 'whatsapp-session');
+// Allow overriding the session directory via env (useful for Render persistent disk)
+const sessionDir = process.env.SESSION_DIR || path.join(__dirname, 'whatsapp-session');
+const browserDir = process.env.BROWSER_DIR || path.join(sessionDir, 'browser-profile');
+
+if (!fs.existsSync(browserDir)) {
+  fs.mkdirSync(browserDir, { recursive: true });
+}
 
 // Initialize WhatsApp Client
 const client = new Client({
@@ -14,32 +20,45 @@ const client = new Client({
     clientId: 'wa-check',
     dataPath: sessionDir,
   }),
+  // Puppeteer options configurable via environment variables:
+  // - PUPPETEER_EXECUTABLE_PATH or CHROME_PATH: path to installed Chrome/Chromium
+  // - PUPPETEER_HEADLESS: 'true' or 'false'
   puppeteer: (function() {
-    // Prefer running with a visible Chrome so QR injection/navigation issues are easier to debug.
-    const defaultArgs = ['--no-sandbox', '--disable-setuid-sandbox'];
-    const chromePath = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-    try {
-      // If Chrome exists at the path, use it with headless false so QR can be displayed.
-      if (require('fs').existsSync(chromePath)) {
-        return { headless: false, executablePath: chromePath, args: defaultArgs };
-      }
-    } catch (e) {
-      console.warn('Could not verify Chrome path, falling back to headless mode:', e && e.message);
+    const defaultArgs = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--single-process',
+      '--disable-gpu'
+    ];
+
+    const execPath = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_PATH;
+    const headlessEnv = process.env.PUPPETEER_HEADLESS;
+    const headless = typeof headlessEnv === 'string' ? headlessEnv.toLowerCase() === 'true' : false;
+
+    const opts = { headless, args: defaultArgs };
+    if (execPath) {
+      opts.executablePath = execPath;
     }
-    // Fallback to headless for environments without Chrome installed at the default path.
-    return { headless: true, args: defaultArgs };
+    return opts;
   })(),
 });
 
 let isClientReady = false;
 let clientInitError = null;
 let latestQRCode = null;
+let pairCodes = {};
+let isPaired = false;
+let latestPairingData = null;
 
 client.on('ready', () => {
   console.log('✓ WhatsApp Client SIAP!');
   isClientReady = true;
   clientInitError = null;
   latestQRCode = null;
+  latestPairingData = null;
 });
 
 client.on('auth_failure', (msg) => {
@@ -53,6 +72,11 @@ client.on('qr', (qr) => {
   latestQRCode = qr;
 });
 
+client.on('pairing_code', (code, details) => {
+  console.log('Pairing code available:', code);
+  latestPairingData = { code: String(code), details: details || null };
+});
+
 client.on('disconnected', (reason) => {
   console.log('✗ WhatsApp terputus:', reason);
   isClientReady = false;
@@ -64,12 +88,31 @@ client.on('error', (error) => {
   clientInitError = error.message;
 });
 
-// Initialize Client dengan timeout
-console.log('Menginisialisasi WhatsApp Client...');
-client.initialize().catch((err) => {
-  console.error('Gagal init:', err.message);
-  clientInitError = err.message;
-});
+function initializeWhatsAppClient() {
+  console.log('Menginisialisasi WhatsApp Client...');
+  client.initialize().catch((err) => {
+    console.error('Gagal init:', err.message);
+    clientInitError = err.message;
+
+    const conflictMessage = String(err.message).toLowerCase();
+    if (conflictMessage.includes('another browser process') || conflictMessage.includes('already running')) {
+      console.warn('Deteksi konflik browser lama. Menghapus direktori browser profil yang mungkin rusak...');
+      try {
+        fs.rmSync(browserDir, { recursive: true, force: true });
+        fs.mkdirSync(browserDir, { recursive: true });
+        console.log('Direktori browser profil dibersihkan. Mencoba inisialisasi ulang...');
+        client.initialize().catch((retryErr) => {
+          console.error('Retry gagal:', retryErr.message);
+          clientInitError = retryErr.message;
+        });
+      } catch (cleanupErr) {
+        console.error('Gagal membersihkan direktori browser profil:', cleanupErr.message);
+      }
+    }
+  });
+}
+
+initializeWhatsAppClient();
 
 // Middleware
 app.use(express.json());
@@ -98,6 +141,10 @@ function saveData(data) {
   fs.writeFileSync(dataFile, JSON.stringify(data, null, 2));
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function incrementCounter(container, key, field, value) {
   if (!container[key]) {
     container[key] = { numbers: 0, bioChecks: 0 };
@@ -111,6 +158,7 @@ app.get('/api/status', (req, res) => {
     ready: isClientReady,
     error: clientInitError,
     qrAvailable: Boolean(latestQRCode),
+    pairingAvailable: Boolean(latestPairingData),
     message: isClientReady
       ? '✓ WhatsApp siap'
       : '✗ WhatsApp tidak siap: ' + (clientInitError || 'Loading...'),
@@ -122,7 +170,59 @@ app.get('/api/qr', (req, res) => {
     ready: isClientReady,
     error: clientInitError,
     qr: latestQRCode,
+    paired: isPaired,
+    pairing: latestPairingData,
   });
+});
+// Force initialize WhatsApp client
+app.post('/api/initialize', (req, res) => {
+  if (isClientReady) {
+    return res.json({
+      status: 'ready',
+      message: 'WhatsApp sudah siap.',
+    });
+  }
+
+  if (!isClientReady) {
+    initializeWhatsAppClient();
+    return res.json({
+      status: 'initializing',
+      message: 'WhatsApp client sedang diinisialisasi ulang. Tunggu beberapa saat...',
+    });
+  }
+
+  res.json({
+    status: 'error',
+    message: clientInitError || 'Error tidak diketahui',
+  });
+});
+
+// Pairing code endpoints
+app.get('/api/pair', (req, res) => {
+  // generate 6-digit code
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  const expires = Date.now() + 5 * 60 * 1000; // 5 minutes
+  pairCodes[code] = { expires };
+  latestPairingData = { code: String(code), expires };
+  console.log('Pair code generated:', code, 'expires at', new Date(expires).toISOString());
+  res.json({ code, expiresAt: new Date(expires).toISOString() });
+});
+
+app.post('/api/pair/confirm', (req, res) => {
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ success: false, error: 'Missing code' });
+  const entry = pairCodes[code];
+  if (!entry) return res.status(404).json({ success: false, error: 'Code not found' });
+  if (Date.now() > entry.expires) {
+    delete pairCodes[code];
+    latestPairingData = null;
+    return res.status(410).json({ success: false, error: 'Code expired' });
+  }
+  isPaired = true;
+  delete pairCodes[code];
+  latestPairingData = null;
+  console.log('Pair confirmed for code', code);
+  res.json({ success: true, paired: true });
 });
 
 app.post('/api/check-numbers', async (req, res) => {
@@ -157,6 +257,18 @@ app.post('/api/check-numbers', async (req, res) => {
       });
     }
 
+    if (numbers.length > 200) {
+      console.log('Input lebih dari 200 nomor');
+      return res.status(400).json({
+        success: false,
+        error: 'Maksimal 200 nomor per request.',
+        results: [],
+        checked: 0,
+        registered: 0,
+        notRegistered: 0,
+      });
+    }
+
     console.log('Mulai cek', numbers.length, 'nomor...');
     const results = [];
     let successCount = 0;
@@ -169,25 +281,29 @@ app.post('/api/check-numbers', async (req, res) => {
       if (!cleaned) {
         failCount++;
         results.push({ input: number, registered: false, cleaned: '' });
-        continue;
-      }
-
-      let registered = false;
-      try {
-        console.log(`[${i+1}/${numbers.length}] Cek: ${cleaned}`);
-        const id = await client.getNumberId(cleaned);
-        registered = id !== null;
-        console.log(`  Result: ${registered ? 'FOUND' : 'NOT FOUND'}`);
-      } catch (err) {
-        console.log(`  Error: ${err.message}`);
-        registered = false;
-      }
-
-      results.push({ input: number, cleaned, registered });
-      if (registered) {
-        successCount++;
       } else {
-        failCount++;
+        let registered = false;
+        try {
+          console.log(`[${i+1}/${numbers.length}] Cek: ${cleaned}`);
+          const id = await client.getNumberId(cleaned);
+          registered = id !== null;
+          console.log(`  Result: ${registered ? 'FOUND' : 'NOT FOUND'}`);
+        } catch (err) {
+          console.log(`  Error: ${err.message}`);
+          registered = false;
+        }
+
+        results.push({ input: number, cleaned, registered });
+        if (registered) {
+          successCount++;
+        } else {
+          failCount++;
+        }
+      }
+
+      if ((i + 1) % 5 === 0 && i + 1 < numbers.length) {
+        console.log('Menunggu 2 detik sebelum melanjutkan...');
+        await delay(2000);
       }
     }
 
